@@ -30,13 +30,17 @@ sealed partial class MainForm : Form
     readonly Icon iconUnread = MakeIcon(unread: true);
     readonly EventWaitHandle activate;
     CoreWebView2Notification? pendingNotification;
+    const int DockWidth = 460;
+    Rectangle preDockBounds;
+    bool preDockTopMost;
+    bool docked;
     int lastUnread;
     int scrapeToken;
     string lastSignature = "";
     bool startHidden;
     bool quitting;
 
-    public MainForm(EventWaitHandle activate, bool startHidden)
+    public MainForm(EventWaitHandle activate, bool startHidden, bool startDocked)
     {
         this.activate = activate;
         this.startHidden = startHidden;
@@ -53,6 +57,17 @@ sealed partial class MainForm : Form
         menu.Items.Add("Ouvrir", null, (_, _) => Restore());
         menu.Items.Add("Accueil", null, (_, _) => { Restore(); web.CoreWebView2?.Navigate(HomeUrl); });
         menu.Items.Add("Tester les notifications", null, async (_, _) => await SendTestNotification());
+        var topmost = new ToolStripMenuItem("Toujours au premier plan");
+        topmost.Click += (_, _) => TopMost = !TopMost;
+        var dock = new ToolStripMenuItem("Épingler sur le côté");
+        dock.Click += (_, _) => { Restore(); ToggleDock(); };
+        menu.Items.Add(topmost);
+        menu.Items.Add(dock);
+        menu.Opening += (_, _) =>
+        {
+            topmost.Checked = TopMost;
+            dock.Checked = docked;
+        };
         var autostart = new ToolStripMenuItem("Démarrer avec Windows") { Checked = IsAutostart() };
         autostart.Click += (_, _) =>
         {
@@ -79,6 +94,7 @@ sealed partial class MainForm : Form
         }
         Shown += (_, _) =>
         {
+            if (startDocked) ToggleDock();
             if (!this.startHidden) return;
             Hide();
             Opacity = 1;
@@ -398,6 +414,29 @@ sealed partial class MainForm : Form
         Activate();
     }
 
+    // Mode épinglé : colonne étroite collée au bord droit de l'écran, toujours au premier plan.
+    // Un second appel restaure la taille, la position et le comportement d'avant.
+    void ToggleDock()
+    {
+        if (!docked)
+        {
+            if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+            preDockBounds = Bounds;
+            preDockTopMost = TopMost;
+            var area = Screen.FromControl(this).WorkingArea;
+            int width = LogicalToDeviceUnits(DockWidth);
+            Bounds = new Rectangle(area.Right - width, area.Top, width, area.Height);
+            TopMost = true;
+            docked = true;
+        }
+        else
+        {
+            Bounds = preDockBounds;
+            TopMost = preDockTopMost;
+            docked = false;
+        }
+    }
+
     void Quit()
     {
         quitting = true;
@@ -444,9 +483,10 @@ sealed partial class MainForm : Form
     {
         try
         {
-            var r = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            // Épinglée, on garde la taille d'avant l'épinglage plutôt que la colonne du bord de l'écran.
+            var r = docked ? preDockBounds : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
             Directory.CreateDirectory(DataDir);
-            File.WriteAllText(BoundsFile, JsonSerializer.Serialize(new SavedBounds(r.X, r.Y, r.Width, r.Height, WindowState == FormWindowState.Maximized)));
+            File.WriteAllText(BoundsFile, JsonSerializer.Serialize(new SavedBounds(r.X, r.Y, r.Width, r.Height, !docked && WindowState == FormWindowState.Maximized)));
         }
         catch { }
     }

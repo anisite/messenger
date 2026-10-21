@@ -14,6 +14,6 @@ static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm(activate, startHidden: args.Contains("--hidden")));
+        Application.Run(new MainForm(activate, startHidden: args.Contains("--hidden"), startDocked: args.Contains("--dock")));
     }
 }
