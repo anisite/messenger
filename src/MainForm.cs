@@ -451,6 +451,22 @@ sealed partial class MainForm : Form
         catch { }
     }
 
+    // --- Barre de titre sombre --------------------------------------------
+
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        // Les attributs non supportés par la version de Windows sont simplement ignorés.
+        SetDwm(20, 1);                                      // mode sombre (Windows 10 2004+)
+        SetDwm(35, ColorTranslator.ToWin32(BackColor));     // couleur de la barre de titre (Windows 11)
+        SetDwm(36, ColorTranslator.ToWin32(Color.White));   // couleur du texte du titre (Windows 11)
+    }
+
+    void SetDwm(int attribute, int value) => DwmSetWindowAttribute(Handle, attribute, ref value, sizeof(int));
+
     // --- Démarrage avec Windows -------------------------------------------
 
     const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
