@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Text;
+using Microsoft.Win32;
+using CommunityToolkit.WinUI.Notifications;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -50,16 +53,18 @@ sealed partial class MainForm : Form
         menu.Items.Add("Ouvrir", null, (_, _) => Restore());
         menu.Items.Add("Accueil", null, (_, _) => { Restore(); web.CoreWebView2?.Navigate(HomeUrl); });
         menu.Items.Add("Tester les notifications", null, async (_, _) => await SendTestNotification());
+        var autostart = new ToolStripMenuItem("Démarrer avec Windows") { Checked = IsAutostart() };
+        autostart.Click += (_, _) =>
+        {
+            SetAutostart(!IsAutostart());
+            autostart.Checked = IsAutostart();
+        };
+        menu.Items.Add(autostart);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quitter", null, (_, _) => Quit());
         tray = new NotifyIcon { Icon = iconIdle, Text = "Messenger", Visible = true, ContextMenuStrip = menu };
         tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) Restore(); };
-        tray.BalloonTipClicked += (_, _) =>
-        {
-            Restore();
-            pendingNotification?.ReportClicked();
-            pendingNotification = null;
-        };
+        ToastNotificationManagerCompat.OnActivated += OnToastActivated;
         Activated += (_, _) => Flash(false);
 
         ThreadPool.RegisterWaitForSingleObject(activate, (_, _) =>
@@ -178,6 +183,11 @@ sealed partial class MainForm : Form
             state = await core.ExecuteScriptAsync("Notification.requestPermission()");
             Log($"requestPermission -> {state}");
         }
+        if (Environment.GetEnvironmentVariable("MW_DEBUG") == "1")
+        {
+            await Task.Delay(6000);
+            await NotifyFromPageAsync(force: true);
+        }
     }
 
     async Task SendTestNotification()
@@ -228,20 +238,20 @@ sealed partial class MainForm : Form
 
     // L'appli web ne déclenche pas l'API Notification : on lit la conversation du haut de la liste
     // (celle qui vient de recevoir un message) et on en fait un toast avec l'expéditeur et le texte.
-    async Task NotifyFromPageAsync()
+    async Task NotifyFromPageAsync(bool force = false)
     {
         int token = ++scrapeToken;
         await Task.Delay(700);
-        if (token != scrapeToken || ActiveForm == this || web.CoreWebView2 == null) return;
+        if (token != scrapeToken || (ActiveForm == this && !force) || web.CoreWebView2 == null) return;
 
         var raw = await web.CoreWebView2.ExecuteScriptAsync(
-            "JSON.stringify([...document.querySelectorAll('a[href*=\"/t/\"]')].slice(0, 15).map(a => ({ h: a.getAttribute('href'), t: a.innerText })))");
+            "JSON.stringify([...document.querySelectorAll('a[href*=\"/t/\"]')].slice(0, 15).map(a => ({ h: a.getAttribute('href'), t: a.innerText, i: (() => { const im = (a.closest('[role=\"row\"], [role=\"gridcell\"], li') ?? a.parentElement?.parentElement ?? a).querySelector('img, image'); return im?.src ?? im?.getAttribute('xlink:href') ?? im?.getAttribute('href'); })() })))");
         Log($"scrape: {raw}");
         if (JsonSerializer.Deserialize<string>(raw) is not { } json) return;
         var rows = JsonSerializer.Deserialize<ThreadRow[]>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         // Les premiers liens /t/ sont des raccourcis ("Discussions · 1 non lus") : une vraie ligne de
         // conversation a plusieurs lignes de texte, et on prend la première qui est non lue.
-        var row = rows?.FirstOrDefault(r => r.T.Contains('\n') && UnreadMarker().IsMatch(r.T));
+        var row = rows?.FirstOrDefault(r => r.T.Contains('\n') && (force || UnreadMarker().IsMatch(r.T)));
         if (row == null) return;
 
         var content = row.T.Split('\n').Select(l => l.Replace(' ', ' ').Trim())
@@ -255,14 +265,69 @@ sealed partial class MainForm : Form
         var sender = content[0];
         var preview = content.Count > 1 ? content[1] : "";
         var signature = row.H + "|" + preview;
-        if (signature == lastSignature) return;
+        if (signature == lastSignature && !force) return;
         lastSignature = signature;
 
         pendingNotification = null;
-        tray.ShowBalloonTip(8000, sender, preview.Length > 0 ? preview : " ", ToolTipIcon.None);
+        ShowToast(sender, preview, row.H, await DownloadAvatarAsync(row.I));
     }
 
-    record ThreadRow(string H, string T);
+    // Toast Windows natif : avatar de l'expéditeur, un clic ouvre la conversation, et un nouveau message
+    // de la même conversation remplace le toast précédent (même Tag).
+    static void ShowToast(string title, string? body, string? href, string? avatarPath)
+    {
+        var builder = new ToastContentBuilder()
+            .AddArgument("href", href ?? "")
+            .AddText(title);
+        if (!string.IsNullOrWhiteSpace(body)) builder.AddText(body);
+        if (avatarPath != null) builder.AddAppLogoOverride(new Uri(avatarPath), ToastGenericAppLogoCrop.Circle);
+        builder.Show(toast =>
+        {
+            toast.Group = "messages";
+            if (!string.IsNullOrEmpty(href)) toast.Tag = href.Length > 60 ? href[..60] : href;
+        });
+    }
+
+    void OnToastActivated(ToastNotificationActivatedEventArgsCompat e)
+    {
+        var args = ToastArguments.Parse(e.Argument);
+        args.TryGetValue("href", out var href);
+        BeginInvoke(async () =>
+        {
+            Restore();
+            pendingNotification?.ReportClicked();
+            pendingNotification = null;
+            if (!string.IsNullOrEmpty(href) && web.CoreWebView2 != null)
+            {
+                // Clic sur le lien de la liste : navigation interne de l'appli, sans recharger la page.
+                await web.CoreWebView2.ExecuteScriptAsync(
+                    $"document.querySelector('a[href=' + JSON.stringify({JsonSerializer.Serialize(href)}) + ']')?.click()");
+            }
+        });
+    }
+
+    static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(4) };
+
+    // L'avatar est téléchargé dans un petit cache : un toast Windows ne peut afficher qu'un fichier local.
+    static async Task<string?> DownloadAvatarAsync(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https" || !uri.Host.Contains("fbcdn")) return null;
+        try
+        {
+            var dir = Path.Combine(DataDir, "avatars");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(Encoding.UTF8.GetBytes(url))) + ".jpg");
+            if (!File.Exists(path)) await File.WriteAllBytesAsync(path, await Http.GetByteArrayAsync(uri));
+            return path;
+        }
+        catch (Exception ex)
+        {
+            Log($"avatar: {ex.Message}");
+            return null;
+        }
+    }
+
+    record ThreadRow(string H, string T, string? I);
 
     [GeneratedRegex(@"^(\(\d+\+?\)\s*)?Messenger(\s*\|.*)?$")]
     private static partial Regex BaseTitle();
@@ -280,8 +345,7 @@ sealed partial class MainForm : Form
         if (ActiveForm == this) return;
 
         pendingNotification = n;
-        tray.ShowBalloonTip(8000, string.IsNullOrWhiteSpace(n.Title) ? "Messenger" : n.Title,
-            string.IsNullOrWhiteSpace(n.Body) ? " " : n.Body, ToolTipIcon.None);
+        ShowToast(string.IsNullOrWhiteSpace(n.Title) ? "Messenger" : n.Title, n.Body, href: null, avatarPath: null);
         Alert();
     }
 
@@ -355,6 +419,7 @@ sealed partial class MainForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        ToastNotificationManagerCompat.History.Clear();
         tray.Dispose();
         web.Dispose();
         base.OnFormClosed(e);
@@ -384,6 +449,26 @@ sealed partial class MainForm : Form
             File.WriteAllText(BoundsFile, JsonSerializer.Serialize(new SavedBounds(r.X, r.Y, r.Width, r.Height, WindowState == FormWindowState.Maximized)));
         }
         catch { }
+    }
+
+    // --- Démarrage avec Windows -------------------------------------------
+
+    const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string RunValueName = "MessengerWrapper";
+
+    static bool IsAutostart()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+        return key?.GetValue(RunValueName) != null;
+    }
+
+    // Lancé au démarrage de Windows avec --hidden : l'app démarre réduite dans la zone de notification.
+    static void SetAutostart(bool enable)
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+        if (key == null) return;
+        if (enable) key.SetValue(RunValueName, $"\"{Environment.ProcessPath}\" --hidden");
+        else key.DeleteValue(RunValueName, throwOnMissingValue: false);
     }
 
     // --- Icône ------------------------------------------------------------
