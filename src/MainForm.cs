@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using Microsoft.Win32;
 using CommunityToolkit.WinUI.Notifications;
@@ -128,6 +128,9 @@ sealed partial class MainForm : Form
         core.Settings.IsPasswordAutosaveEnabled = true;
 
         core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low;
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(
+            (Environment.GetEnvironmentVariable("MW_DEBUG") == "1" ? "window.__mwDebug = true;" : "") + OpenImageScript);
+        core.WebMessageReceived += OnWebMessageReceived;
         core.NavigationStarting += OnNavigationStarting;
         core.NewWindowRequested += OnNewWindowRequested;
         core.PermissionRequested += OnPermissionRequested;
@@ -176,6 +179,7 @@ sealed partial class MainForm : Form
     {
         if (!Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) || !IsHttp(uri)) return;
 
+        Log($"nouvelle fenêtre: {uri.Host}{uri.AbsolutePath}");
         // Liens externes -> navigateur par défaut ; popups internes (appels, etc.) -> fenêtre WebView2 par défaut.
         var target = UnwrapRedirect(uri) ?? uri;
         if (target != uri || !IsInternal(uri))
@@ -198,11 +202,6 @@ sealed partial class MainForm : Form
         {
             state = await core.ExecuteScriptAsync("Notification.requestPermission()");
             Log($"requestPermission -> {state}");
-        }
-        if (Environment.GetEnvironmentVariable("MW_DEBUG") == "1")
-        {
-            await Task.Delay(6000);
-            await NotifyFromPageAsync(force: true);
         }
     }
 
@@ -231,6 +230,143 @@ sealed partial class MainForm : Form
         {
             e.State = CoreWebView2PermissionState.Allow;
         }
+    }
+
+    // --- Images -----------------------------------------------------------
+
+    // Un clic sur une image de message l'ouvre hors de l'appli (Maj+clic : visionneuse intégrée).
+    // La miniature du fil est petite (480 px) : on laisse la page ouvrir sa visionneuse (rendue invisible), on lit
+    // l'image en grande taille qu'elle charge, on l'envoie à l'appli, puis on referme la visionneuse.
+    // Dans les conversations chiffrées (/e2ee/) l'image est un blob: valide seulement dans la page : on la renvoie
+    // en data: URL pour que l'appli l'enregistre dans un fichier temporaire.
+    const string OpenImageScript = """
+        (() => {
+          const wait = ms => new Promise(r => setTimeout(r, ms));
+          const dialogImage = () => [...document.querySelectorAll('[role="dialog"] img')]
+            .filter(i => i.complete && i.naturalWidth > 0 && i.getBoundingClientRect().width >= 200)
+            .sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)[0];
+
+          async function toDataUrl(img) {
+            const src = img.currentSrc || img.src;
+            if (/^data:/.test(src)) return src;
+            try {
+              const blob = await (await fetch(src)).blob();
+              return await new Promise(ok => { const f = new FileReader(); f.onload = () => ok(f.result); f.readAsDataURL(blob); });
+            } catch {
+              // fetch peut être bloqué par la CSP de la page : on redessine l'image dans un canvas (blob: = même origine).
+              const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
+              c.getContext('2d').drawImage(img, 0, 0);
+              return c.toDataURL('image/jpeg', 0.95);
+            }
+          }
+
+          async function closeViewer() {
+            const viewerOpen = () => !!document.querySelector('[role="dialog"]');
+            const button = [...document.querySelectorAll('[role="dialog"] [aria-label]')]
+              .find(b => /fermer|close/i.test(b.getAttribute('aria-label')));
+            if (button) { button.click(); await wait(300); }
+            // Échap une seule fois, et seulement si la visionneuse est encore ouverte : une fois fermée,
+            // Échap ferme la conversation.
+            if (viewerOpen()) {
+              document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+            }
+          }
+
+          async function openFromViewer() {
+            const hide = document.createElement('style');
+            hide.textContent = '[role="dialog"] { opacity: 0 !important; }';
+            document.head.appendChild(hide);
+            try {
+              let big;
+              for (let i = 0; i < 50 && !(big = dialogImage()); i++) await wait(100);
+              if (!big) return;
+              const src = big.currentSrc || big.src;
+              if (/^https:/.test(src)) chrome.webview.postMessage({ url: src });
+              else chrome.webview.postMessage({ data: await toDataUrl(big) });
+              await closeViewer();
+            } catch (err) {
+              chrome.webview.postMessage({ error: String(err) });
+            } finally {
+              setTimeout(() => hide.remove(), 500);
+            }
+          }
+
+          let reopening = false;
+          document.addEventListener('click', e => {
+            if (e.shiftKey || e.button !== 0 || reopening) return;
+            // L'image peut être recouverte par un calque transparent : on regarde tout ce qui est sous le pointeur.
+            const thumb = document.elementsFromPoint(e.clientX, e.clientY)
+              .find(el => el instanceof HTMLImageElement && el.getBoundingClientRect().width >= 120 && el.getBoundingClientRect().height >= 120);
+            if (!thumb || !thumb.closest('[role="main"]')) return;
+            // Un lien autre que le média du message (aperçu de lien...) garde son comportement normal.
+            const link = thumb.closest('a[href]');
+            if (link && !link.getAttribute('href').startsWith('/messenger_media/')) return;
+
+            if (e.ctrlKey || e.metaKey) {
+              // Ctrl+clic : navigateur par défaut. Le clic réel est annulé et remplacé par un clic simple, que la
+              // page traite en ouvrant sa visionneuse (rendue invisible par openFromViewer).
+              e.preventDefault(); e.stopImmediatePropagation();
+              reopening = true;
+              thumb.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0, clientX: e.clientX, clientY: e.clientY }));
+              reopening = false;
+              openFromViewer();
+            } else if (link) {
+              // Clic normal : page du média dans une fenêtre à part (comportement du Ctrl+clic d'origine).
+              e.preventDefault(); e.stopImmediatePropagation();
+              window.open(link.href, '_blank');
+            }
+          }, true);
+        })();
+        """;
+
+    static readonly string ImageTempDir = Path.Combine(Path.GetTempPath(), "MessengerWrapper");
+
+    void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        if (!Uri.TryCreate(e.Source, UriKind.Absolute, out var origin) || !IsInternal(origin)) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(e.WebMessageAsJson);
+            if (doc.RootElement.TryGetProperty("url", out var url)
+                && Uri.TryCreate(url.GetString(), UriKind.Absolute, out var image)
+                && image.Scheme == "https" && (image.Host.Contains("fbcdn") || image.Host.Contains("fbsbx")))
+            {
+                Log($"image ouverte: {image.Host}{image.AbsolutePath}");
+                OpenExternal(image);
+            }
+            else if (doc.RootElement.TryGetProperty("data", out var data))
+            {
+                OpenDataImage(data.GetString());
+            }
+            else if (doc.RootElement.TryGetProperty("dbg", out var dbg))
+            {
+                Log("clic: " + string.Join(" | ", dbg.EnumerateArray().Select(x => x.GetString())));
+            }
+            else if (doc.RootElement.TryGetProperty("error", out var error))
+            {
+                Log($"image (page): {error.GetString()}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"image: {ex.Message}");
+        }
+    }
+
+    static void OpenDataImage(string? dataUrl)
+    {
+        var m = Regex.Match(dataUrl ?? "", @"^data:image/(jpeg|png|gif|webp);base64,(.+)$", RegexOptions.Singleline);
+        if (!m.Success || m.Groups[2].Length > 35_000_000) return;
+
+        Directory.CreateDirectory(ImageTempDir);
+        foreach (var old in Directory.EnumerateFiles(ImageTempDir, "image-*").Where(f => File.GetLastWriteTimeUtc(f) < DateTime.UtcNow.AddDays(-1)))
+            File.Delete(old);
+
+        var ext = m.Groups[1].Value == "jpeg" ? "jpg" : m.Groups[1].Value;
+        var path = Path.Combine(ImageTempDir, $"image-{Guid.NewGuid():N}.{ext}");
+        File.WriteAllBytes(path, Convert.FromBase64String(m.Groups[2].Value));
+        Log($"image ouverte: {path}");
+        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
     }
 
     // --- Fenêtre / zone de notification ----------------------------------
@@ -428,13 +564,25 @@ sealed partial class MainForm : Form
             Bounds = new Rectangle(area.Right - width, area.Top, width, area.Height);
             TopMost = true;
             docked = true;
+            MaximizeBox = false;
         }
         else
         {
+            docked = false;
+            MaximizeBox = true;
             Bounds = preDockBounds;
             TopMost = preDockTopMost;
-            docked = false;
         }
+    }
+
+    // Épinglée, la fenêtre est verrouillée : déplacement, redimensionnement et agrandissement sont refusés
+    // (glisser la barre de titre, bords, double-clic sur le titre, Alt+Espace...). Désépingler pour les rétablir.
+    const int WmSysCommand = 0x0112, ScSize = 0xF000, ScMove = 0xF010, ScMaximize = 0xF030;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (docked && m.Msg == WmSysCommand && ((int)m.WParam & 0xFFF0) is ScSize or ScMove or ScMaximize) return;
+        base.WndProc(ref m);
     }
 
     void Quit()
