@@ -129,7 +129,7 @@ sealed partial class MainForm : Form
 
         core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low;
         await core.AddScriptToExecuteOnDocumentCreatedAsync(
-            (Environment.GetEnvironmentVariable("MW_DEBUG") == "1" ? "window.__mwDebug = true;" : "") + OpenImageScript);
+            (Environment.GetEnvironmentVariable("MW_DEBUG") == "1" ? "window.__mwDebug = true;" : "") + OpenImageScript + CloseConversationScript);
         core.WebMessageReceived += OnWebMessageReceived;
         core.NavigationStarting += OnNavigationStarting;
         core.NewWindowRequested += OnNewWindowRequested;
@@ -319,7 +319,38 @@ sealed partial class MainForm : Form
         })();
         """;
 
-    static readonly string ImageTempDir = Path.Combine(Path.GetTempPath(), "MessengerWrapper");
+    // Échap ferme la conversation ouverte (Messenger n'a pas ce raccourci) : navigation interne vers /t/, sans recharger.
+    // Rien ne se passe si Échap sert déjà à autre chose : visionneuse ou menu ouvert (vérifié avant que la page
+    // traite la touche, sinon on fermerait aussi la conversation en refermant la visionneuse), ou brouillon en cours.
+    const string CloseConversationScript = """
+        (() => {
+          let armed = false;
+          const close = () => {
+            history.pushState({}, '', '/t/');
+            window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+          };
+          // Phase de capture : on décide avant que la page traite la touche.
+          window.addEventListener('keydown', e => {
+            armed = false;
+            if (e.key !== 'Escape' || e.repeat || !/^\/(e2ee\/)?t\/\d+/.test(location.pathname)) return;
+            if (document.querySelector('[role="dialog"], [role="menu"], [role="listbox"]')) return;
+            const a = document.activeElement;
+            if (a?.matches?.('input, textarea, [contenteditable="true"]')) {
+              // Zone de saisie : la page y consomme Échap (elle enlève juste le focus). Brouillon en cours : on ne touche à rien.
+              if (!(a.value ?? a.textContent ?? '').trim()) close();
+              return;
+            }
+            armed = true;
+          }, true);
+          // Ailleurs : on ferme seulement si la page n'a pas déjà utilisé la touche.
+          window.addEventListener('keydown', e => {
+            if (armed && !e.defaultPrevented) close();
+            armed = false;
+          });
+        })();
+        """;
+
+    static readonly string ImageTempDir =Path.Combine(Path.GetTempPath(), "MessengerWrapper");
 
     void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
